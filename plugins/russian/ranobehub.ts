@@ -2,6 +2,7 @@ import { Plugin } from '@/types/plugin';
 import { FilterTypes, Filters } from '@libs/filterInputs';
 import { fetchApi } from '@libs/fetch';
 import { NovelStatus } from '@libs/novelStatus';
+import { load as parseHTML } from 'cheerio';
 import dayjs from 'dayjs';
 
 const statusKey: Record<number, string> = {
@@ -13,7 +14,7 @@ const statusKey: Record<number, string> = {
 class RNBH implements Plugin.PluginBase {
   id = 'RNBH.org';
   name = 'RanobeHub';
-  version = '1.0.3';
+  version = '1.0.4';
   site = 'https://ranobehub.org';
   icon = 'src/ru/ranobehub/icon.png';
 
@@ -24,99 +25,112 @@ class RNBH implements Plugin.PluginBase {
       filters,
     }: Plugin.PopularNovelsOptions<typeof this.filters>,
   ): Promise<Plugin.NovelItem[]> {
-    let url = this.site + '/api/search?page=' + pageNo + '&sort=';
-    url += showLatestNovels
-      ? 'last_chapter_at'
-      : filters?.sort?.value || 'computed_rating';
-    url += '&status=' + (filters?.status?.value ? filters?.status?.value : '0');
-
-    if (filters) {
-      if (filters.country?.value?.length) {
-        url += '&country=' + filters.country.value.join(',');
-      }
-
-      const includeTags = [
-        filters.tags?.value?.include,
-        filters.events?.value?.include,
-      ]
-        .flat()
-        .filter(t => t);
-
-      if (includeTags.length) {
-        url += '&tags:positive=' + includeTags.join(',');
-      }
-
-      const excludeTags = [
-        filters.tags?.value?.exclude,
-        filters.events?.value?.exclude,
-      ]
-        .flat()
-        .filter(t => t);
-
-      if (excludeTags.length) {
-        url += '&tags:negative=' + excludeTags.join(',');
-      }
-    }
-    const { resource }: { resource: responseNovels[] } = await fetchApi(
-      url + '&take=40',
-    ).then(res => res.json());
-
-    const novels: Plugin.NovelItem[] = [];
-    resource.forEach(novel =>
-      novels.push({
-        name: novel.names.rus || novel.names.eng || novel.names.original,
-        cover: novel.poster.medium,
-        path: novel.id.toString(),
-      }),
+    const params = new URLSearchParams();
+    params.set('page', pageNo.toString());
+    params.set(
+      'sort',
+      showLatestNovels ? 'updated' : filters?.sort?.value || 'rating',
     );
 
-    return novels;
+    if (filters) {
+      if (filters.status?.value) {
+        params.set('status', filters.status.value);
+      }
+      filters.country?.value?.forEach(country =>
+        params.append('country', country),
+      );
+      filters.tags?.value?.include?.forEach(tag => params.append('tag', tag));
+      filters.events?.value?.include?.forEach(event =>
+        params.append('event', event),
+      );
+    }
+
+    const { items }: CatalogResponse = await fetchApi(
+      this.site + '/api/catalog?' + params.toString(),
+    ).then(res => res.json());
+
+    return items.map(novel => ({
+      name: novel.title,
+      cover: this.site + novel.posterUrl,
+      path: novel.id + '-' + novel.slug,
+    }));
   }
 
   async parseNovel(novelPath: string): Promise<Plugin.SourceNovel> {
-    const { data }: { data: responseNovel } = await fetchApi(
-      this.site + '/api/ranobe/' + novelPath,
-    ).then(res => res.json());
+    const bookId = parseInt(novelPath, 10);
+
+    const body = await fetchApi(this.resolveUrl(novelPath)).then(res =>
+      res.text(),
+    );
+    const $ = parseHTML(body);
+
+    const name =
+      $('.book-title-cyrillic').first().text().trim() ||
+      $('.book-original-title').first().text().trim();
+
+    const coverSrc = $('.book-poster-gallery img').first().attr('src') || '';
+    const coverMatch = decodeURIComponent(coverSrc).match(/\/api\/media\/\d+/);
+
+    const summary =
+      $('.book-description-copy').text().trim() ||
+      $('.book-hero-summary').text().trim();
+
+    const author = $('.book-author-byline strong')
+      .map((_, el) => $(el).text().trim())
+      .get()
+      .join(', ');
+
+    const statusHref = $('.book-kicker-status').attr('href') || '';
+    const statusId = statusHref.match(/status=(\d+)/)?.[1];
 
     const novel: Plugin.SourceNovel = {
       path: novelPath,
-      name: data.names.rus || data.names.eng || '',
-      cover: data.posters.medium,
-      summary: data.description
-        .replace(/<br\s*\/?>/gi, '\n')
-        .replace(/<\/p>/gi, '\n\n')
-        .replace(/<[^>]+>/g, '')
-        .trim(),
-      author: data?.authors?.[0]?.name_eng || '',
-      status: statusKey[data.status.id] || NovelStatus.Unknown,
+      name,
+      cover: coverMatch
+        ? this.site + coverMatch[0] + '?size=medium'
+        : undefined,
+      summary,
+      author,
+      status: statusId
+        ? statusKey[parseInt(statusId, 10)] || NovelStatus.Unknown
+        : NovelStatus.Unknown,
     };
 
-    const tags = [data.tags.events, data.tags.genres]
-      .flat()
-      .map(tags => tags?.names?.rus || tags?.names?.eng || tags?.title)
-      .filter(tags => tags);
+    const genres = $('.book-hero-taxonomy a[href^="/tag/"]')
+      .map((_, el) => $(el).text().trim())
+      .get()
+      .filter(tag => tag);
 
-    if (tags.length) {
-      novel.genres = tags.join(', ');
+    if (genres.length) {
+      novel.genres = genres.join(', ');
     }
 
     const chapters: Plugin.ChapterItem[] = [];
-    const chaptersJSON: { volumes: VolumesEntity[] } = await fetchApi(
-      this.site + '/api/ranobe/' + novelPath + '/contents',
-    ).then(res => res.json());
+    let offset = 0;
+    for (;;) {
+      const params = new URLSearchParams({
+        q: '',
+        sort: 'asc',
+        limit: '100',
+        offset: offset.toString(),
+      });
+      const chaptersJSON: ChapterListResponse = await fetchApi(
+        this.site + '/api/books/' + bookId + '/chapters?' + params.toString(),
+      ).then(res => res.json());
 
-    chaptersJSON.volumes.forEach(volume =>
-      volume.chapters?.forEach(chapter =>
+      chaptersJSON.items.forEach(chapter =>
         chapters.push({
-          name: chapter.name,
-          path: novelPath + '/' + volume.num + '/' + chapter.num,
-          releaseTime: dayjs(parseInt(chapter.changed_at, 10) * 1000).format(
-            'LLL',
-          ),
+          name:
+            chapter.title || `Том ${chapter.volume}, Глава ${chapter.number}`,
+          path: novelPath + '/chapter/' + chapter.id,
+          releaseTime: dayjs(chapter.changedAt).format('LLL'),
           chapterNumber: chapters.length + 1,
         }),
-      ),
-    );
+      );
+
+      if (chaptersJSON.nextOffset === null) break;
+      offset = chaptersJSON.nextOffset;
+    }
 
     novel.chapters = chapters;
     return novel;
@@ -126,40 +140,24 @@ class RNBH implements Plugin.PluginBase {
     const body = await fetchApi(this.resolveUrl(chapterPath)).then(res =>
       res.text(),
     );
+    const $ = parseHTML(body);
 
-    const indexA = body.indexOf('<div class="title-wrapper">');
-    const indexB = body.indexOf('<div class="ui text container"', indexA);
+    $('.reader-ad-slot').remove();
 
-    const chapterText = body
-      .substring(indexA, indexB)
-      .replace(/<img data-media-id="(.*?)".*?>/g, '<img src="/api/media/$1">');
-
-    return chapterText;
+    return $('.reader-content').first().html() || '';
   }
 
   async searchNovels(searchTerm: string): Promise<Plugin.NovelItem[]> {
-    const url = `${this.site}/api/fulltext/global?query=${searchTerm}&take=10`;
-    const result: responseSearch[] = await fetchApi(url).then(res =>
-      res.json(),
-    );
-    const novels: Plugin.NovelItem[] = [];
+    const params = new URLSearchParams({ q: searchTerm, page: '1' });
+    const { items }: CatalogResponse = await fetchApi(
+      this.site + '/api/catalog?' + params.toString(),
+    ).then(res => res.json());
 
-    result
-      ?.find(item => item?.meta?.key === 'ranobe')
-      ?.data?.forEach(novel =>
-        novels.push({
-          name:
-            novel?.names?.rus ||
-            novel?.names?.eng ||
-            novel.name ||
-            novel?.names?.original ||
-            '',
-          path: novel.id.toString(),
-          cover: novel?.image?.replace('/small', '/medium'),
-        }),
-      );
-
-    return novels;
+    return items.map(novel => ({
+      name: novel.title,
+      cover: this.site + novel.posterUrl,
+      path: novel.id + '-' + novel.slug,
+    }));
   }
 
   resolveUrl = (path: string) => this.site + '/ranobe/' + path;
@@ -167,15 +165,15 @@ class RNBH implements Plugin.PluginBase {
   filters = {
     sort: {
       label: 'Сортировка',
-      value: 'computed_rating',
+      value: 'rating',
       options: [
-        { label: 'по рейтингу', value: 'computed_rating' },
-        { label: 'по дате обновления', value: 'last_chapter_at' },
-        { label: 'по дате добавления', value: 'created_at' },
-        { label: 'по названию', value: 'name_rus' },
-        { label: 'по просмотрам', value: 'views' },
-        { label: 'по количеству глав', value: 'count_chapters' },
-        { label: 'по объему перевода', value: 'count_of_symbols' },
+        { label: 'по рейтингу', value: 'rating' },
+        { label: 'по дате обновления', value: 'updated' },
+        { label: 'по популярности', value: 'popular' },
+        { label: 'сначала новые', value: 'new' },
+        { label: 'по количеству глав', value: 'chapters' },
+        { label: 'скрытые жемчужины', value: 'underrated' },
+        { label: 'из глубины каталога', value: 'rediscover' },
       ],
       type: FilterTypes.Picker,
     },
@@ -1148,136 +1146,47 @@ class RNBH implements Plugin.PluginBase {
 
 export default new RNBH();
 
-type responseNovels = {
+type CatalogItem = {
   id: number;
-  names: Names;
-  rating: number;
-  synopsis: string;
-  url: string;
-  poster: Poster;
-  created_at: number;
+  slug: string;
+  title: string;
+  originalTitle?: string;
+  description?: string;
+  shortDescription?: string | null;
+  year?: number | null;
   status: string;
-  user?: User;
-  counts: Counts;
-};
-type Names = {
-  eng?: string;
-  rus?: string;
-  original: string;
-};
-type Poster = {
-  medium: string;
-  small: string;
-  color: string;
-};
-type User = {
-  status?: null;
-  liked: boolean;
-};
-type Counts = {
-  volumes: string;
-  chapters: string;
-};
-
-type responseNovel = {
-  id: number;
-  names: Names;
   rating: number;
-  year: number;
-  synopsis: string;
-  url: string;
-  posters: Posters;
-  isSpecial: boolean;
-  liked: boolean;
-  authors?: AuthorsEntity[] | null;
-  translators?: TranslatorsEntity[] | null;
-  description: string;
-  status: Status;
-  start_reading_url: string;
-  html: string;
-  tags: Tags;
-};
-type Posters = {
-  big: string;
-  medium: string;
-  small: string;
-  tiny: string;
-  color: string;
-};
-type AuthorsEntity = {
-  name_eng: string;
-  pivot: Pivot;
-};
-type Pivot = {
-  ranobe_id: number;
-  author_id?: number;
-  translator_id?: number;
-};
-type TranslatorsEntity = {
-  name: string;
-  pivot: Pivot;
-};
-type Status = {
-  id: number;
-  title: string;
-  name: string;
-};
-type Tags = {
-  events?: GenresOrEntity[] | null;
-  genres?: GenresOrEntity[] | null;
-};
-type GenresOrEntity = {
-  id: number;
-  names: Names;
-  url: string;
-  title: string;
-  description?: string | null;
+  views: number;
+  chapters: number;
+  volumes: number;
+  coverHue?: number;
+  isOriginalWork: boolean;
+  posterUrl: string;
+  updatedAt: string;
+  tags: string[];
 };
 
-type VolumesEntity = {
-  id: number;
-  num: number;
-  name: string;
-  status: Status;
-  chapters?: ChaptersEntity[] | null;
+type CatalogResponse = {
+  items: CatalogItem[];
+  total: number;
+  page: number;
+  pages: number;
 };
 
-type ChaptersEntity = {
+type ChapterListItem = {
   id: number;
-  name: string;
-  num: number;
-  url: string;
-  is_new: boolean;
-  has_images: boolean;
-  changed_at: string;
-  comments_count: string;
-};
-
-type responseSearch = {
-  meta: Meta;
-  collections?: DataEntity[] | null;
-  data?: DataEntity[] | null;
-};
-type Meta = {
-  key: string;
+  bookId: number;
+  volume: number;
+  number: number;
   title: string;
+  hasImages: boolean;
+  publishedAt: string;
+  changedAt: string;
 };
-type DataEntity = {
-  id: number;
-  names?: Names | null;
-  description?: string | null;
-  url: string;
-  image?: string | null;
-  name?: string | null;
-  level?: number | null;
-  evolution_scheme?: null;
-  roles?: null[] | null;
-  avatar?: Avatar | null;
-  has_plus?: boolean | null;
-};
-type Avatar = {
-  big: string;
-  color: string;
-  thumb: string;
-  is_default: boolean;
+
+type ChapterListResponse = {
+  items: ChapterListItem[];
+  total: number;
+  offset: number;
+  nextOffset: number | null;
 };
